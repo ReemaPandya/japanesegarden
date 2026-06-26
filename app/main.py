@@ -12,8 +12,8 @@ from app.idempotency import (
     MissingIdempotencyKey,
     validate_idempotency_key,
 )
-from app.schemas import CreditRequest, MAX_TEXT_LENGTH
-from app.service import credit_wallet
+from app.schemas import CreditRequest, MAX_TEXT_LENGTH, WalletStateResponse
+from app.service import credit_wallet, get_wallet_state
 
 
 app = FastAPI(
@@ -69,3 +69,10 @@ def credit_player_wallet(
         raise HTTPException(status_code=409, detail=str(error))
 
     return JSONResponse(status_code=status_code, content=response_body)
+
+
+@app.get("/v1/wallets/{playerId}", response_model=WalletStateResponse)
+def read_player_wallet(
+    playerId: Annotated[str, Path(min_length=1, max_length=MAX_TEXT_LENGTH)],
+) -> dict:
+    return get_wallet_state(playerId)

@@ -130,3 +130,47 @@ def credit_wallet(
             )
 
             return 200, response_body
+
+
+def get_wallet_state(player_id: str) -> dict[str, Any]:
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT balance
+                FROM wallets
+                WHERE player_id = %s;
+                """,
+                (player_id,),
+            )
+            wallet = cur.fetchone()
+
+            balance = int(wallet["balance"]) if wallet is not None else 0
+
+            cur.execute(
+                """
+                SELECT item_id
+                FROM inventory_items
+                WHERE player_id = %s
+                ORDER BY id ASC;
+                """,
+                (player_id,),
+            )
+            inventory = [row["item_id"] for row in cur.fetchall()]
+
+            cur.execute(
+                """
+                SELECT reward_id
+                FROM claimed_rewards
+                WHERE player_id = %s
+                ORDER BY claimed_at ASC, reward_id ASC;
+                """,
+                (player_id,),
+            )
+            claimed_rewards = [row["reward_id"] for row in cur.fetchall()]
+
+    return {
+        "balance": balance,
+        "inventory": inventory,
+        "claimedRewards": claimed_rewards,
+    }
