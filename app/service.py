@@ -4,7 +4,7 @@ from typing import Any
 
 from app.db import get_connection
 from app.idempotency import begin_idempotent_request, complete_idempotent_request
-from app.schemas import CreditRequest, PurchaseRequest
+from app.schemas import ClaimRewardRequest, CreditRequest, PurchaseRequest
 
 
 MAX_WALLET_BALANCE = 1_000_000_000_000
@@ -14,6 +14,21 @@ ITEM_CATALOG: dict[str, int] = {
     "shield": 75,
     "iron_sword": 100,
     "dragon_armor": 300,
+}
+
+REWARD_CATALOG: dict[str, dict[str, Any]] = {
+    "daily-login": {
+        "currency": 50,
+        "itemId": None,
+    },
+    "starter-pack": {
+        "currency": 100,
+        "itemId": "potion",
+    },
+    "founder-gift": {
+        "currency": 250,
+        "itemId": "shield",
+    },
 }
 
 
@@ -303,6 +318,197 @@ def purchase_item(
                 "price": server_price,
                 "balance": new_balance,
                 "inventoryGranted": True,
+            }
+
+            complete_idempotent_request(
+                cur,
+                idempotency_key=idempotency_key,
+                status_code=200,
+                response_body=response_body,
+            )
+
+            return 200, response_body
+
+
+def claim_reward(
+    *,
+    reward_id: str,
+    request: ClaimRewardRequest,
+    idempotency_key: str,
+) -> tuple[int, dict[str, Any]]:
+    endpoint = f"/v1/rewards/{reward_id}/claim"
+    request_body = request.model_dump()
+    player_id = request.playerId
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            idem = begin_idempotent_request(
+                cur,
+                idempotency_key=idempotency_key,
+                method="POST",
+                endpoint=endpoint,
+                request_body=request_body,
+            )
+
+            if idem.is_duplicate:
+                return idem.status_code or 200, idem.response_body or {}
+
+            reward = REWARD_CATALOG.get(reward_id)
+
+            if reward is None:
+                response_body = {
+                    "error": "unknown_reward",
+                    "message": "Reward is not available in the server-side catalog.",
+                    "rewardId": reward_id,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=404,
+                    response_body=response_body,
+                )
+
+                return 404, response_body
+
+            reward_currency = int(reward["currency"])
+            reward_item = reward["itemId"]
+
+            cur.execute(
+                """
+                INSERT INTO wallets (player_id, balance)
+                VALUES (%s, 0)
+                ON CONFLICT (player_id) DO NOTHING;
+                """,
+                (player_id,),
+            )
+
+            cur.execute(
+                """
+                SELECT player_id, balance
+                FROM wallets
+                WHERE player_id = %s
+                FOR UPDATE;
+                """,
+                (player_id,),
+            )
+
+            wallet = cur.fetchone()
+
+            if wallet is None:
+                response_body = {
+                    "error": "wallet_not_found",
+                    "message": "Wallet could not be created or loaded.",
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=500,
+                    response_body=response_body,
+                )
+
+                return 500, response_body
+
+            current_balance = int(wallet["balance"])
+            new_balance = current_balance + reward_currency
+
+            if new_balance > MAX_WALLET_BALANCE:
+                response_body = {
+                    "error": "balance_limit_exceeded",
+                    "message": "Reward would exceed the maximum allowed wallet balance.",
+                    "balance": current_balance,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                    response_body=response_body,
+                )
+
+                return 409, response_body
+
+            cur.execute(
+                """
+                INSERT INTO claimed_rewards (player_id, reward_id)
+                VALUES (%s, %s)
+                ON CONFLICT (player_id, reward_id) DO NOTHING
+                RETURNING reward_id;
+                """,
+                (player_id, reward_id),
+            )
+
+            inserted_claim = cur.fetchone()
+
+            if inserted_claim is None:
+                response_body = {
+                    "error": "reward_already_claimed",
+                    "message": "Reward has already been claimed by this player.",
+                    "playerId": player_id,
+                    "rewardId": reward_id,
+                    "balance": current_balance,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                    response_body=response_body,
+                )
+
+                return 409, response_body
+
+            cur.execute(
+                """
+                UPDATE wallets
+                SET balance = %s, updated_at = now()
+                WHERE player_id = %s;
+                """,
+                (new_balance, player_id),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO ledger_entries (
+                    player_id,
+                    entry_type,
+                    amount,
+                    reason,
+                    reward_id,
+                    idempotency_key
+                )
+                VALUES (%s, 'reward', %s, %s, %s, %s);
+                """,
+                (
+                    player_id,
+                    reward_currency,
+                    "reward_claim",
+                    reward_id,
+                    idempotency_key,
+                ),
+            )
+
+            if reward_item is not None:
+                cur.execute(
+                    """
+                    INSERT INTO inventory_items (
+                        player_id,
+                        item_id,
+                        source_idempotency_key
+                    )
+                    VALUES (%s, %s, %s);
+                    """,
+                    (player_id, reward_item, idempotency_key),
+                )
+
+            response_body = {
+                "playerId": player_id,
+                "rewardId": reward_id,
+                "currencyGranted": reward_currency,
+                "itemGranted": reward_item,
+                "balance": new_balance,
+                "claimed": True,
             }
 
             complete_idempotent_request(

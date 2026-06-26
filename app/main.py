@@ -13,12 +13,13 @@ from app.idempotency import (
     validate_idempotency_key,
 )
 from app.schemas import (
+    ClaimRewardRequest,
     CreditRequest,
     MAX_TEXT_LENGTH,
     PurchaseRequest,
     WalletStateResponse,
 )
-from app.service import credit_wallet, get_wallet_state, purchase_item
+from app.service import claim_reward, credit_wallet, get_wallet_state, purchase_item
 
 
 app = FastAPI(
@@ -92,6 +93,31 @@ def purchase_from_shop(
     try:
         status_code, response_body = purchase_item(
             player_id=playerId,
+            request=body,
+            idempotency_key=clean_key,
+        )
+    except IdempotencyConflict as error:
+        raise HTTPException(status_code=409, detail=str(error))
+
+    return JSONResponse(status_code=status_code, content=response_body)
+
+
+@app.post("/v1/rewards/{rewardId}/claim")
+def claim_player_reward(
+    rewardId: Annotated[str, Path(min_length=1, max_length=MAX_TEXT_LENGTH)],
+    body: ClaimRewardRequest,
+    idempotency_key: Annotated[str | None, Header(alias="Idempotency-Key")] = None,
+) -> JSONResponse:
+    try:
+        clean_key = validate_idempotency_key(idempotency_key)
+    except MissingIdempotencyKey as error:
+        raise HTTPException(status_code=400, detail=str(error))
+    except InvalidIdempotencyKey as error:
+        raise HTTPException(status_code=400, detail=str(error))
+
+    try:
+        status_code, response_body = claim_reward(
+            reward_id=rewardId,
             request=body,
             idempotency_key=clean_key,
         )
