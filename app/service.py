@@ -4,10 +4,17 @@ from typing import Any
 
 from app.db import get_connection
 from app.idempotency import begin_idempotent_request, complete_idempotent_request
-from app.schemas import CreditRequest
+from app.schemas import CreditRequest, PurchaseRequest
 
 
 MAX_WALLET_BALANCE = 1_000_000_000_000
+
+ITEM_CATALOG: dict[str, int] = {
+    "potion": 25,
+    "shield": 75,
+    "iron_sword": 100,
+    "dragon_armor": 300,
+}
 
 
 def credit_wallet(
@@ -120,6 +127,182 @@ def credit_wallet(
                 "credited": request.amount,
                 "reason": request.reason,
                 "balance": new_balance,
+            }
+
+            complete_idempotent_request(
+                cur,
+                idempotency_key=idempotency_key,
+                status_code=200,
+                response_body=response_body,
+            )
+
+            return 200, response_body
+
+
+def purchase_item(
+    *,
+    player_id: str,
+    request: PurchaseRequest,
+    idempotency_key: str,
+) -> tuple[int, dict[str, Any]]:
+    endpoint = f"/v1/wallets/{player_id}/purchase"
+    request_body = request.model_dump()
+
+    with get_connection() as conn:
+        with conn.cursor() as cur:
+            idem = begin_idempotent_request(
+                cur,
+                idempotency_key=idempotency_key,
+                method="POST",
+                endpoint=endpoint,
+                request_body=request_body,
+            )
+
+            if idem.is_duplicate:
+                return idem.status_code or 200, idem.response_body or {}
+
+            server_price = ITEM_CATALOG.get(request.itemId)
+
+            if server_price is None:
+                response_body = {
+                    "error": "unknown_item",
+                    "message": "Item is not available in the server-side catalog.",
+                    "itemId": request.itemId,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=404,
+                    response_body=response_body,
+                )
+
+                return 404, response_body
+
+            if request.price != server_price:
+                response_body = {
+                    "error": "price_mismatch",
+                    "message": "Submitted price does not match the authoritative server price.",
+                    "itemId": request.itemId,
+                    "submittedPrice": request.price,
+                    "serverPrice": server_price,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                    response_body=response_body,
+                )
+
+                return 409, response_body
+
+            cur.execute(
+                """
+                INSERT INTO wallets (player_id, balance)
+                VALUES (%s, 0)
+                ON CONFLICT (player_id) DO NOTHING;
+                """,
+                (player_id,),
+            )
+
+            cur.execute(
+                """
+                SELECT player_id, balance
+                FROM wallets
+                WHERE player_id = %s
+                FOR UPDATE;
+                """,
+                (player_id,),
+            )
+
+            wallet = cur.fetchone()
+
+            if wallet is None:
+                response_body = {
+                    "error": "wallet_not_found",
+                    "message": "Wallet could not be created or loaded.",
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=500,
+                    response_body=response_body,
+                )
+
+                return 500, response_body
+
+            current_balance = int(wallet["balance"])
+
+            if current_balance < server_price:
+                response_body = {
+                    "error": "insufficient_funds",
+                    "message": "Wallet balance is too low for this purchase.",
+                    "itemId": request.itemId,
+                    "price": server_price,
+                    "balance": current_balance,
+                }
+
+                complete_idempotent_request(
+                    cur,
+                    idempotency_key=idempotency_key,
+                    status_code=409,
+                    response_body=response_body,
+                )
+
+                return 409, response_body
+
+            new_balance = current_balance - server_price
+
+            cur.execute(
+                """
+                UPDATE wallets
+                SET balance = %s, updated_at = now()
+                WHERE player_id = %s;
+                """,
+                (new_balance, player_id),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO inventory_items (
+                    player_id,
+                    item_id,
+                    source_idempotency_key
+                )
+                VALUES (%s, %s, %s);
+                """,
+                (player_id, request.itemId, idempotency_key),
+            )
+
+            cur.execute(
+                """
+                INSERT INTO ledger_entries (
+                    player_id,
+                    entry_type,
+                    amount,
+                    reason,
+                    item_id,
+                    idempotency_key
+                )
+                VALUES (%s, 'purchase', %s, %s, %s, %s);
+                """,
+                (
+                    player_id,
+                    -server_price,
+                    "shop_purchase",
+                    request.itemId,
+                    idempotency_key,
+                ),
+            )
+
+            response_body = {
+                "playerId": player_id,
+                "itemId": request.itemId,
+                "price": server_price,
+                "balance": new_balance,
+                "inventoryGranted": True,
             }
 
             complete_idempotent_request(
