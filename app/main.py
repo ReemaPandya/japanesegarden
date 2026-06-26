@@ -26,10 +26,10 @@ def health() -> dict:
 def db_health() -> dict:
     with get_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
+            cur.execute("SELECT 1 AS ok;")
             result = cur.fetchone()
 
     return {
         "status": "ok",
-        "db": result[0],
+        "db": result["ok"],
     }

@@ -3,10 +3,10 @@ from __future__ import annotations
 import os
 import time
 from pathlib import Path
-from typing import Iterator
 
 import psycopg
 from psycopg import Connection
+from psycopg.rows import dict_row
 
 
 DATABASE_URL = os.getenv(
@@ -16,7 +16,7 @@ DATABASE_URL = os.getenv(
 
 
 def get_connection() -> Connection:
-    return psycopg.connect(DATABASE_URL)
+    return psycopg.connect(DATABASE_URL, row_factory=dict_row)
 
 
 def wait_for_db(max_attempts: int = 20, delay_seconds: float = 1.0) -> None:
@@ -26,7 +26,7 @@ def wait_for_db(max_attempts: int = 20, delay_seconds: float = 1.0) -> None:
         try:
             with get_connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute("SELECT 1;")
+                    cur.execute("SELECT 1 AS ok;")
                     cur.fetchone()
             return
         except Exception as error:

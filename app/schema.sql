@@ -37,7 +37,22 @@ CREATE TABLE IF NOT EXISTS idempotency_requests (
     method TEXT NOT NULL,
     endpoint TEXT NOT NULL,
     request_hash TEXT NOT NULL,
-    status_code INT NOT NULL,
-    response_body JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+    status TEXT NOT NULL CHECK (status IN ('processing', 'completed')),
+    status_code INT,
+    response_body JSONB,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+    CHECK (
+        (
+            status = 'processing'
+            AND status_code IS NULL
+            AND response_body IS NULL
+        )
+        OR
+        (
+            status = 'completed'
+            AND status_code IS NOT NULL
+            AND response_body IS NOT NULL
+        )
+    )
 );
